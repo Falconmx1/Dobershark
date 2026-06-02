@@ -70,3 +70,20 @@ python dobershark.py -i wlan0 -f "udp port 53"
 
 # Guardar captura a archivo
 python dobershark.py -i eth0 -f "tcp" -o captura.pcap
+
+## 🌟 Características avanzadas (v3.0)
+
+### 🔍 IPv6 completo
+- Captura y análisis de tráfico IPv6
+- Compresión automática de direcciones
+- ICMPv6, TCPv6, UDPv6 y HTTP sobre IPv6
+
+### 📁 Extracción de archivos SMB
+- Reconstruye archivos transferidos por SMB/CIFS (puerto 445)
+- Detecta comandos Create AndX y WRITE AndX
+- Guarda archivos en carpeta `smb_extracted/` con timestamp
+
+### 🤫 Modo silencioso
+```bash
+python dobershark.py -i eth0 -s              # Sin banner
+python dobershark.py -i eth0 -f "tcp port 445" -s -o captura.pcap
