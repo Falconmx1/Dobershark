@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Dobershark v3.0 - IPv6, SMB file extraction, Silent mode
-# "El Doberman ahora caza en IPv6 y recupera archivos SMB"
+# Dobershark v4.0 - HTTP file extraction + TCP session reassembly + Packet injection
+# "El Doberman ahora reconstruye, extrae y muerde activamente"
 # Compatible: Windows (Npcap), Linux, Termux
 
 import sys
@@ -8,286 +8,381 @@ import os
 import signal
 import re
 import hashlib
+import threading
+import time
 from datetime import datetime
 from collections import defaultdict
-
-try:
-    from scapy.all import *
-    from scapy.layers.inet import IP, TCP, UDP, ICMP
-    from scapy.layers.inet6 import IPv6, ICMPv6Unknown, ICMPv6EchoRequest, ICMPv6EchoReply
-    from scapy.layers.l2 import Ether, ARP
-    from scapy.layers.dot11 import Dot11
-    from scapy.layers.smb import SMB, SMB_Header, SMB_Parameters, SMB_Data
-except ImportError:
-    print("[!] Scapy no instalado. Ejecuta: pip install scapy")
-    sys.exit(1)
+from scapy.all import *
+from scapy.layers.inet import IP, TCP, UDP, ICMP
+from scapy.layers.inet6 import IPv6, ICMPv6EchoRequest, ICMPv6EchoReply
+from scapy.layers.l2 import Ether, ARP
+from scapy.layers.http import HTTP, HTTPRequest, HTTPResponse
 
 # ========== CONFIGURACIÓN ==========
 SILENT_MODE = False
+HTTP_DOWNLOAD_DIR = "http_downloads"
+TCP_SESSION_DIR = "tcp_sessions"
 SMB_FILE_DIR = "smb_extracted"
-os.makedirs(SMB_FILE_DIR, exist_ok=True)
+INJECTION_RULES = []
 
-# Para reconstruir archivos SMB (simple reassembly por conexión)
-smb_sessions = defaultdict(lambda: {'data': b'', 'filename': None, 'size': 0})
+for dir_name in [HTTP_DOWNLOAD_DIR, TCP_SESSION_DIR, SMB_FILE_DIR]:
+    os.makedirs(dir_name, exist_ok=True)
 
-# ========== BANNER DOBERMAN (versión silenciable) ==========
+# ========== TCP SESSION REASSEMBLY ==========
+class TCPSession:
+    def __init__(self, src_ip, src_port, dst_ip, dst_port):
+        self.src_ip = src_ip
+        self.src_port = src_port
+        self.dst_ip = dst_ip
+        self.dst_port = dst_port
+        self.key = f"{src_ip}:{src_port}-{dst_ip}:{dst_port}"
+        self.buffer = b''
+        self.segments = {}  # seq -> data
+        self.next_seq = None
+        self.start_time = datetime.now()
+        self.last_seen = datetime.now()
+        self.bytes_received = 0
+        self.bytes_sent = 0
+        
+    def add_segment(self, seq, data, direction='rx'):
+        self.last_seen = datetime.now()
+        if direction == 'rx':
+            self.bytes_received += len(data)
+        else:
+            self.bytes_sent += len(data)
+        
+        # Reensamblaje simple (ordenar por seq)
+        self.segments[seq] = data
+        self._reassemble()
+    
+    def _reassemble(self):
+        if not self.segments:
+            return
+        
+        # Ordenar segmentos por número de secuencia
+        sorted_seqs = sorted(self.segments.keys())
+        
+        # Si no tenemos next_seq, empezar con el seq más bajo
+        if self.next_seq is None:
+            self.next_seq = sorted_seqs[0]
+            self.buffer = b''
+        
+        # Agregar segmentos en orden
+        new_buffer = b''
+        current_seq = self.next_seq
+        
+        for seq in sorted_seqs:
+            if seq == current_seq:
+                new_buffer += self.segments[seq]
+                current_seq += len(self.segments[seq])
+        
+        if new_buffer:
+            self.buffer = new_buffer
+            self.next_seq = current_seq
+            # Guardar sesión periódicamente
+            if len(self.buffer) > 1024 * 10:  # Cada 10KB
+                self.save_session()
+    
+    def save_session(self):
+        if len(self.buffer) > 0:
+            filename = f"{TCP_SESSION_DIR}/{self.key.replace(':', '_')}_{self.start_time.strftime('%Y%m%d_%H%M%S')}.bin"
+            with open(filename, 'wb') as f:
+                f.write(self.buffer)
+            if not SILENT_MODE:
+                print(f"[TCP Session] Guardada: {filename} ({len(self.buffer)} bytes)")
+    
+    def get_stats(self):
+        return {
+            'bytes_rx': self.bytes_received,
+            'bytes_tx': self.bytes_sent,
+            'duration': (datetime.now() - self.start_time).total_seconds(),
+            'packets': len(self.segments)
+        }
+
+tcp_sessions = {}
+
+# ========== HTTP FILE EXTRACTION ==========
+class HTTPFileExtractor:
+    def __init__(self):
+        self.downloads = {}  # connection -> {'data': b'', 'filename': None, 'headers': {}}
+        self.content_lengths = {}
+        
+    def extract_filename(self, headers, url):
+        # Intentar extraer nombre del Content-Disposition
+        if 'Content-Disposition' in headers:
+            match = re.search(r'filename="?([^"]+)"?', headers['Content-Disposition'])
+            if match:
+                return match.group(1)
+        
+        # Del URL
+        if url:
+            filename = url.split('/')[-1].split('?')[0]
+            if filename and '.' in filename and len(filename) < 255:
+                return filename
+        
+        # Por defecto
+        return f"download_{datetime.now().strftime('%Y%m%d_%H%M%S')}.bin"
+    
+    def process_response(self, conn_key, response_data, headers, url):
+        if conn_key not in self.downloads:
+            self.downloads[conn_key] = {'data': b'', 'filename': None, 'headers': headers}
+        
+        download = self.downloads[conn_key]
+        download['data'] += response_data
+        download['headers'] = headers
+        
+        if not download['filename']:
+            download['filename'] = self.extract_filename(headers, url)
+        
+        # Verificar si completamos la descarga (por Content-Length)
+        content_length = int(headers.get('Content-Length', 0))
+        if content_length > 0 and len(download['data']) >= content_length:
+            self.save_file(conn_key)
+        # También guardar si hay chunked encoding y vemos el final
+        elif b'0\r\n\r\n' in response_data[-10:]:
+            self.save_file(conn_key)
+    
+    def save_file(self, conn_key):
+        download = self.downloads[conn_key]
+        if len(download['data']) > 0:
+            filepath = os.path.join(HTTP_DOWNLOAD_DIR, download['filename'])
+            # Evitar sobrescritura
+            counter = 1
+            original = filepath
+            while os.path.exists(filepath):
+                name, ext = os.path.splitext(original)
+                filepath = f"{name}_{counter}{ext}"
+                counter += 1
+            
+            with open(filepath, 'wb') as f:
+                f.write(download['data'])
+            
+            md5 = hashlib.md5(download['data']).hexdigest()
+            if not SILENT_MODE:
+                print(f"[📥 HTTP Download] {download['filename']} -> {filepath}")
+                print(f"  Size: {len(download['data'])} bytes | MD5: {md5}")
+            
+            del self.downloads[conn_key]
+
+http_extractor = HTTPFileExtractor()
+
+# ========== PACKET INJECTION ENGINE ==========
+class PacketInjector:
+    def __init__(self, iface):
+        self.iface = iface
+        self.injected_count = 0
+        self.rules = []  # (filter_function, response_packet)
+        
+    def add_rule(self, filter_func, response_packet):
+        """Agrega una regla: si filter_func(packet) es True, inyecta response_packet"""
+        self.rules.append((filter_func, response_packet))
+    
+    def inject_packet(self, packet):
+        """Inyecta un paquete en la red"""
+        try:
+            sendp(packet, iface=self.iface, verbose=False)
+            self.injected_count += 1
+            if not SILENT_MODE:
+                print(f"[💉 Injected] {packet.summary()}")
+        except Exception as e:
+            print(f"[!] Injection error: {e}")
+    
+    def check_rules(self, packet):
+        """Verifica si algún paquete dispara una regla de inyección"""
+        for filter_func, response in self.rules:
+            if filter_func(packet):
+                self.inject_packet(response)
+                break
+
+# ========== DOBERMAN BANNER ==========
 BANNER = """
-    ╔═══════════════════════════════════════════════════════════════╗
-    ║         🐕‍🦺 DOBERSHARK v3.0 - IPv6 + SMB + SILENT MODE       ║
-    ║   "Olfateando en IPv6, mordiendo archivos SMB en silencio"   ║
-    ╚═══════════════════════════════════════════════════════════════╝
+    ╔═══════════════════════════════════════════════════════════════════════╗
+    ║         🐕‍🦺 DOBERSHARK v4.0 - TCP REASSEMBLY + HTTP EXTRACTION + INJECTION  ║
+    ║   "Reconstruye, extrae y muerde activamente. El Doberman total."    ║
+    ╚═══════════════════════════════════════════════════════════════════════╝
 
          __
-        / _)   ¡GRRR! IPv6, SMB extraction y stealth mode activados.
+        / _)   ¡GRRR-RRR! Ahora también inyecto paquetes.
        | (    
         ¯¯¯
 """
 
-# =======================================
-
 running = True
+injector = None
 
 def signal_handler(sig, frame):
     global running
-    if not SILENT_MODE:
-        print("\n[Dobershark] Deteniendo captura...")
+    print("\n[Dobershark] Cerrando sesiones y guardando archivos...")
+    
+    # Guardar todas las sesiones TCP pendientes
+    for session in tcp_sessions.values():
+        session.save_session()
+    
+    if injector and injector.injected_count > 0:
+        print(f"[💉] Total paquetes inyectados: {injector.injected_count}")
+    
     running = False
-    # Resumen de archivos SMB extraídos
-    if not SILENT_MODE and any(s['filename'] for s in smb_sessions.values()):
-        print(f"\n[📁 Archivos SMB extraídos en: {SMB_FILE_DIR}/]")
-        for session, data in smb_sessions.items():
-            if data['filename']:
-                print(f"  - {data['filename']} ({len(data['data'])} bytes)")
     sys.exit(0)
 
-def compress_ipv6(addr):
-    """Comprime dirección IPv6 para mostrar (::)"""
+def extract_http_headers(payload):
+    """Extrae cabeceras HTTP de datos binarios"""
     try:
-        # Scapy a veces devuelve objeto, a veces string
-        if hasattr(addr, 'compressed'):
-            return addr.compressed
-        compressed = re.sub(r':0{1,3}(?=:|$)', ':', str(addr))
-        compressed = re.sub(r':{3,}', '::', compressed)
-        return compressed.strip(':')
-    except:
-        return str(addr)
-
-def parse_http_payload(payload_bytes):
-    """Extrae método, URL, cabeceras y cuerpo de HTTP"""
-    try:
-        payload = payload_bytes.decode('utf-8', errors='ignore')
-        if not payload.startswith(('GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'CONNECT')):
-            return None
-        
-        lines = payload.split('\r\n')
-        request_line = lines[0]
-        parts = request_line.split(' ')
-        if len(parts) >= 3:
-            method = parts[0]
-            url = parts[1]
-            version = parts[2]
-            
+        # Buscar el final de las cabeceras (\r\n\r\n)
+        header_end = payload.find(b'\r\n\r\n')
+        if header_end > 0:
+            headers_raw = payload[:header_end].decode('utf-8', errors='ignore')
             headers = {}
-            body = ""
-            body_start = False
-            for line in lines[1:]:
-                if line == '':
-                    body_start = True
-                    continue
-                if not body_start and ': ' in line:
+            for line in headers_raw.split('\r\n'):
+                if ': ' in line:
                     key, value = line.split(': ', 1)
                     headers[key] = value
-                elif body_start:
-                    body += line + "\n"
-            
-            return {
-                'method': method,
-                'url': url,
-                'version': version,
-                'headers': headers,
-                'body': body.strip()
-            }
+            # Extraer URL de la primera línea si es request
+            first_line = headers_raw.split('\r\n')[0]
+            if first_line.startswith(('GET', 'POST', 'PUT', 'DELETE')):
+                parts = first_line.split(' ')
+                if len(parts) >= 2:
+                    return headers, parts[1]
+            return headers, None
     except:
         pass
-    return None
-
-def extract_smb_files(packet, src_ip, dst_ip, src_port, dst_port, payload):
-    """Detecta y extrae archivos de tráfico SMB (versión simplificada)"""
-    # Identificar sesiones SMB (puerto 445)
-    if (src_port == 445 or dst_port == 445) and len(payload) > 0:
-        session_key = f"{src_ip}:{src_port}-{dst_ip}:{dst_port}"
-        
-        # Buscar nombres de archivo comunes en SMB (patrón simple)
-        payload_str = payload.decode('latin-1', errors='ignore')
-        
-        # Buscar patrones de escritura SMB (Create AndX Request)
-        if b'\\x00\\x00\\x00\\x02' in payload[:20]:  # SMB COMnand Create AndX
-            # Extraer posible nombre de archivo (ASCIIZ después de ciertos offsets)
-            match = re.search(b'[A-Za-z0-9_\\-\\.]+\\.[A-Za-z0-9]{2,4}', payload)
-            if match and len(match.group()) > 3:
-                filename = match.group().decode('latin-1', errors='ignore')
-                smb_sessions[session_key]['filename'] = filename
-                if not SILENT_MODE:
-                    print(f"  [SMB] Detectado archivo: {filename}")
-        
-        # Acumular datos de escritura (WRITE AndX)
-        if b'\\x00\\x00\\x00\\x0F' in payload[:20]:  # WRITE AndX command
-            # Buscar datos después del encabezado (aproximado)
-            if len(payload) > 100:
-                file_data = payload[64:]  # Offset típico
-                smb_sessions[session_key]['data'] += file_data
-                smb_sessions[session_key]['size'] += len(file_data)
-        
-        # Si el archivo tiene datos y parece completo (fin de sesión o EOF)
-        if smb_sessions[session_key]['filename'] and smb_sessions[session_key]['size'] > 0:
-            filename = smb_sessions[session_key]['filename']
-            filepath = os.path.join(SMB_FILE_DIR, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}")
-            with open(filepath, 'wb') as f:
-                f.write(smb_sessions[session_key]['data'][:smb_sessions[session_key]['size']])
-            if not SILENT_MODE:
-                print(f"  [💾 SMB] Archivo guardado: {filepath} ({smb_sessions[session_key]['size']} bytes)")
-            # Limpiar sesión para no duplicar
-            smb_sessions[session_key]['data'] = b''
+    return {}, None
 
 def packet_callback(packet):
-    """Procesa paquetes con IPv6, VLAN, HTTP detallado y extracción SMB"""
-    global SILENT_MODE
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    vlan_id = None
+    """Procesador principal con reassembly, extracción e inyección"""
+    global injector
     
-    # ========== VLAN (802.1Q) ==========
-    if packet.haslayer(Dot1Q):
-        vlan_layer = packet[Dot1Q]
-        vlan_id = vlan_layer.vlan
-        inner_packet = packet[Dot1Q].payload
-        if not SILENT_MODE:
-            print(f"\n[VLAN {vlan_id}] Prio: {vlan_layer.prio}")
-    else:
-        inner_packet = packet
+    # ========== INYECCIÓN: Verificar reglas primero ==========
+    if injector:
+        injector.check_rules(packet)
     
-    # ========== ETHERNET ==========
-    if Ether in inner_packet and not SILENT_MODE:
-        src_mac = inner_packet[Ether].src
-        dst_mac = inner_packet[Ether].dst
-        if vlan_id:
-            print(f"[VLAN{vlan_id}] MAC: {src_mac} -> {dst_mac}")
+    # ========== TCP SESSION REASSEMBLY ==========
+    if TCP in packet and IP in packet:
+        ip_layer = packet[IP]
+        tcp_layer = packet[TCP]
+        payload = bytes(tcp_layer.payload)
+        
+        if len(payload) == 0:
+            return  # Sin datos útiles
+        
+        src_ip = ip_layer.src
+        dst_ip = ip_layer.dst
+        src_port = tcp_layer.sport
+        dst_port = tcp_layer.dport
+        seq = tcp_layer.seq
+        
+        # Clave de sesión (bidireccional)
+        session_key = f"{src_ip}:{src_port}-{dst_ip}:{dst_port}"
+        reverse_key = f"{dst_ip}:{dst_port}-{src_ip}:{src_port}"
+        
+        if session_key in tcp_sessions:
+            session = tcp_sessions[session_key]
+            session.add_segment(seq, payload, 'rx')
+        elif reverse_key in tcp_sessions:
+            session = tcp_sessions[reverse_key]
+            session.add_segment(seq, payload, 'tx')
         else:
-            print(f"[ETHER] {src_mac} -> {dst_mac}")
-    
-    # ========== IPv6 (NUEVO) ==========
-    if IPv6 in inner_packet:
-        ip6 = inner_packet[IPv6]
-        src_ip = compress_ipv6(ip6.src)
-        dst_ip = compress_ipv6(ip6.dst)
-        traffic_class = ip6.tc
-        flow_label = ip6.fl
-        next_header = ip6.nh
-        hop_limit = ip6.hlim
-        
-        if not SILENT_MODE:
-            print(f"[IPv6] {src_ip} -> {dst_ip} | TC:{traffic_class} NH:{next_header} HL:{hop_limit}")
-        
-        # ICMPv6 (ping6, neighbor discovery)
-        if ICMPv6Unknown in inner_packet or ICMPv6EchoRequest in inner_packet:
-            print(f"[ICMPv6] {src_ip} -> {dst_ip} | Echo Request/Reply")
-        
-        # TCP sobre IPv6
-        if TCP in inner_packet:
-            tcp = inner_packet[TCP]
-            src_port = tcp.sport
-            dst_port = tcp.dport
-            flags = tcp.flags
-            payload = bytes(tcp.payload)
+            # Nueva sesión
+            session = TCPSession(src_ip, src_port, dst_ip, dst_port)
+            session.add_segment(seq, payload, 'rx')
+            tcp_sessions[session_key] = session
             
-            # HTTP sobre IPv6
-            if (src_port == 80 or dst_port == 80) and payload:
-                http_info = parse_http_payload(payload)
-                if http_info and not SILENT_MODE:
-                    print(f"[HTTPv6 {http_info['method']}] {src_ip}:{src_port} -> {dst_ip}:{dst_port}")
-                    print(f"  URL: {http_info['url']}")
-                    if 'Host' in http_info['headers']:
-                        print(f"  Host: {http_info['headers']['Host']}")
-            else:
-                if not SILENT_MODE:
-                    print(f"[TCPv6] {timestamp} | {src_ip}:{src_port} -> {dst_ip}:{dst_port} | Flags: {flags}")
-        
-        # UDP sobre IPv6
-        elif UDP in inner_packet:
-            udp = inner_packet[UDP]
-            src_port = udp.sport
-            dst_port = udp.dport
             if not SILENT_MODE:
-                print(f"[UDPv6] {timestamp} | {src_ip}:{src_port} -> {dst_ip}:{dst_port}")
+                print(f"\n[TCP Session] Nueva: {session_key}")
+        
+        # ========== HTTP FILE EXTRACTION ==========
+        if src_port == 80 or dst_port == 80 or src_port == 8080 or dst_port == 8080:
+            if len(payload) > 0:
+                # Intentar extraer HTTP response
+                if b'HTTP/' in payload[:20] and (b'200 OK' in payload[:100] or b'206 Partial' in payload[:100]):
+                    headers, _ = extract_http_headers(payload)
+                    if headers:
+                        # Buscar Content-Type que sugiera archivo
+                        content_type = headers.get('Content-Type', '')
+                        if any(x in content_type.lower() for x in ['application', 'image', 'video', 'audio', 'octet-stream']):
+                            # Extraer el cuerpo después de las cabeceras
+                            header_end = payload.find(b'\r\n\r\n')
+                            if header_end > 0:
+                                body = payload[header_end + 4:]
+                                conn_key = f"{dst_ip}:{dst_port}-{src_ip}:{src_port}"
+                                # Extraer URL de la request correspondiente (simplificado)
+                                url = headers.get('Content-Location', headers.get('Location', '/'))
+                                http_extractor.process_response(conn_key, body, headers, url)
+
+def create_injection_packet(template_packet, modifications):
+    """Crea un paquete para inyectar basado en uno capturado"""
+    pkt = template_packet.copy()
+    for layer, fields in modifications.items():
+        if hasattr(pkt, layer):
+            for field, value in fields.items():
+                setattr(pkt[layer], field, value)
+    return pkt
+
+def load_injection_rules():
+    """Carga reglas de inyección predefinidas (ejemplo)"""
+    if not injector:
+        return
     
-    # ========== IPv4 ==========
-    elif IP in inner_packet:
-        src_ip = inner_packet[IP].src
-        dst_ip = inner_packet[IP].dst
-        proto = inner_packet[IP].proto
-        
-        # TCP
-        if TCP in inner_packet:
-            src_port = inner_packet[TCP].sport
-            dst_port = inner_packet[TCP].dport
-            flags = inner_packet[TCP].flags
-            payload = bytes(inner_packet[TCP].payload)
-            
-            # 🎯 SMB FILE EXTRACTION (nuevo)
-            extract_smb_files(packet, src_ip, dst_ip, src_port, dst_port, payload)
-            
-            # HTTP detallado
-            if (src_port == 80 or dst_port == 80 or src_port == 8080 or dst_port == 8080) and payload:
-                http_info = parse_http_payload(payload)
-                if http_info and not SILENT_MODE:
-                    print(f"\n[HTTP {http_info['method']}] {src_ip}:{src_port} -> {dst_ip}:{dst_port}")
-                    print(f"  URL: {http_info['url']}")
-                    if 'Host' in http_info['headers']:
-                        print(f"  Host: {http_info['headers']['Host']}")
-                    if 'User-Agent' in http_info['headers']:
-                        print(f"  User-Agent: {http_info['headers']['User-Agent'][:60]}...")
-                    if http_info['body']:
-                        print(f"  Body: {http_info['body'][:200]}")
-            else:
-                if not SILENT_MODE:
-                    print(f"[TCP] {timestamp} | {src_ip}:{src_port} -> {dst_ip}:{dst_port} | Flags: {flags} | Len: {len(payload)}")
-        
-        # UDP (y DNS)
-        elif UDP in inner_packet:
-            src_port = inner_packet[UDP].sport
-            dst_port = inner_packet[UDP].dport
-            if not SILENT_MODE:
-                print(f"[UDP] {timestamp} | {src_ip}:{src_port} -> {dst_ip}:{dst_port}")
-            if inner_packet.haslayer(DNS) and inner_packet.haslayer(DNSQR):
-                qname = inner_packet[DNSQR].qname.decode('utf-8')
-                if not SILENT_MODE:
-                    print(f"  [DNS] Consulta: {qname}")
-        
-        # ICMP
-        elif ICMP in inner_packet:
-            if not SILENT_MODE:
-                print(f"[ICMP] {timestamp} | {src_ip} -> {dst_ip}")
+    # Regla 1: Responder a pings ICMP (mostrar presencia)
+    def icmp_filter(packet):
+        return ICMP in packet and packet[ICMP].type == 8  # Echo Request
     
-    # ========== ARP ==========
-    elif ARP in inner_packet and not SILENT_MODE:
-        src_ip = inner_packet[ARP].psrc
-        dst_ip = inner_packet[ARP].pdst
-        op = "Request" if inner_packet[ARP].op == 1 else "Reply"
-        print(f"[ARP] {timestamp} | {op} | {src_ip} -> {dst_ip}")
+    # Construir respuesta ICMP Echo Reply
+    def make_icmp_reply(original):
+        reply = IP(src=original[IP].dst, dst=original[IP].src)/ICMP(type=0, id=original[ICMP].id, seq=original[ICMP].seq)
+        return reply
+    
+    injector.add_rule(icmp_filter, make_icmp_reply)
+    
+    # Regla 2: Bloquear paquetes a cierta IP (responder con RST)
+    def rst_filter(packet):
+        if TCP in packet and packet[TCP].dport == 22:  # SSH
+            target_ip = "192.168.1.100"  # Cambiar por IP a bloquear
+            return packet[IP].dst == target_ip
+    
+    def make_rst_packet(original):
+        rst = IP(src=original[IP].dst, dst=original[IP].src)/TCP(
+            sport=original[TCP].dport,
+            dport=original[TCP].sport,
+            seq=original[TCP].ack,
+            ack=original[TCP].seq + 1,
+            flags='R'
+        )
+        return rst
+    
+    injector.add_rule(rst_filter, make_rst_packet)
+    
+    if not SILENT_MODE:
+        print("[Injection] Reglas cargadas: ICMP reply + TCP RST a SSH")
+
+def parse_hex_packet(hex_string):
+    """Convierte string hexadecimal a paquete para inyección"""
+    try:
+        raw_bytes = bytes.fromhex(hex_string)
+        return Ether(raw_bytes)
+    except:
+        return None
 
 def main():
-    global running, SILENT_MODE
+    global running, injector, SILENT_MODE
     
-    # Parseo de argumentos
+    # Parsear argumentos
     iface = None
     filtro = None
     output_file = None
     list_interfaces = False
+    inject_hex = None
+    custom_rule = None
     
     for i, arg in enumerate(sys.argv):
         if arg in ["--list-interfaces", "-l"]:
             list_interfaces = True
         elif arg in ["--silent", "-s"]:
             SILENT_MODE = True
+        elif arg == "--bite":
+            # Modo mordida activa (inyección)
+            custom_rule = True
+        elif arg == "--inject-hex" and i+1 < len(sys.argv):
+            inject_hex = sys.argv[i+1]
         elif arg == "-i" and i+1 < len(sys.argv):
             iface = sys.argv[i+1]
         elif arg == "-f" and i+1 < len(sys.argv):
@@ -295,11 +390,10 @@ def main():
         elif arg == "-o" and i+1 < len(sys.argv):
             output_file = sys.argv[i+1]
     
-    # Mostrar banner solo si NO está en modo silencioso
     if not SILENT_MODE:
         print(BANNER)
     else:
-        print("[Dobershark] Modo silencioso activado (sin banner, solo datos críticos)")
+        print("[Dobershark] Modo silencioso")
     
     signal.signal(signal.SIGINT, signal_handler)
     
@@ -310,21 +404,45 @@ def main():
         return
     
     if not iface:
-        print("[!] Uso: python dobershark.py -i <interfaz> [-f 'filtro'] [-o archivo.pcap] [-s|--silent]")
+        print("[!] Uso: python dobershark.py -i <interfaz> [--bite] [--inject-hex <hex>]")
         print("[!] Ver interfaces: python dobershark.py --list-interfaces")
-        print("\nEjemplos:")
-        print("  python dobershark.py -i eth0")
-        print("  python dobershark.py -i wlan0 -f 'tcp port 80'")
-        print("  python dobershark.py -i eth0 -s               # Modo silencioso")
-        print("  python dobershark.py -i eth0 -f 'ip6'         # Solo IPv6")
+        print("\nNuevos modos:")
+        print("  --bite              Activa inyección activa (responde pings, bloquea SSH)")
+        print("  --inject-hex <hex>  Inyecta un paquete personalizado (hex string)")
+        print("  -s                  Modo silencioso (sin banner)")
         sys.exit(1)
     
+    # Inicializar inyector
+    injector = PacketInjector(iface)
+    
+    # Inyección de paquete único
+    if inject_hex:
+        packet = parse_hex_packet(inject_hex)
+        if packet:
+            injector.inject_packet(packet)
+            print(f"[*] Paquete inyectado en {iface}")
+        else:
+            print("[!] Hex inválido. Usa formato: '001122334455...'")
+        return
+    
+    # Cargar reglas de inyección si está en modo bite
+    if custom_rule:
+        load_injection_rules()
+        if not SILENT_MODE:
+            print("[🐕‍🦺] Modo BITE activado - El Doberman responde activamente")
+    
+    # Mostrar configuración
     if not SILENT_MODE:
         print(f"[Dobershark] Capturando en: {iface}")
+        print(f"[Dobershark] HTTP downloads -> {HTTP_DOWNLOAD_DIR}/")
+        print(f"[Dobershark] TCP sessions   -> {TCP_SESSION_DIR}/")
+        print(f"[Dobershark] SMB files      -> {SMB_FILE_DIR}/")
         if filtro:
             print(f"[Dobershark] Filtro BPF: {filtro}")
         if output_file:
             print(f"[Dobershark] Guardando a: {output_file}")
+        if custom_rule:
+            print(f"[🐕‍🦺] Inyección activa: ON")
         print("[Dobershark] Ctrl+C para detener...\n")
     
     try:
@@ -333,9 +451,6 @@ def main():
         print("\n[!] Permisos insuficientes. Ejecuta con sudo/administrador.")
     except Exception as e:
         print(f"\n[!] Error: {e}")
-        if not SILENT_MODE:
-            print("[!] En Windows: asegura Npcap instalado")
-            print("[!] En Linux/Termux: sudo python dobershark.py -i eth0")
 
 if __name__ == "__main__":
     main()
