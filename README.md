@@ -30,71 +30,35 @@ __
 ¯¯¯
 
 
-## 🛠️ Instalación
-
-### Windows (con Npcap)
-```bash
-# 1. Instalar Npcap desde https://npcap.com (marcar "WinPcap API-compatible Mode")
-# 2. Instalar Python 3.7+
-# 3. Clonar e instalar dependencias
-git clone https://github.com/Falconmx1/Dobershark.git
-cd Dobershark
-pip install -r requirements.txt
-
-Linux (Debian/Ubuntu/Kali)
+🚀 Instalación completa (Windows/Linux/Termux)
+Linux/Kali:
 sudo apt update
 sudo apt install python3 python3-pip tcpdump
+pip3 install scapy flask flask-socketio eventlet mitmproxy
 git clone https://github.com/Falconmx1/Dobershark.git
 cd Dobershark
-pip3 install -r requirements.txt
+sudo python3 dobershark.py -i eth0 --web --https
 
-Termux (Android)
-pkg update && pkg upgrade
-pkg install python tcpdump git
-git clone https://github.com/Falconmx1/Dobershark.git
-cd Dobershark
-pip install -r requirements.txt
+Windows:
+# Instalar Npcap desde npcap.com
+pip install scapy flask flask-socketio eventlet mitmproxy
+python dobershark.py -i "Ethernet" --web
 
-🚀 Ejemplos de uso
-Extraer archivos HTTP descargados
-python dobershark.py -i eth0 -f "tcp port 80"
-# Los archivos aparecerán en http_downloads/
-Reconstruir sesiones TCP completas
-python dobershark.py -i eth0 -f "tcp"
-# Las sesiones se guardan en tcp_sessions/ como archivos binarios
-Modo BITE (respuesta activa)
-# Responde a pings y bloquea SSH a IP específica (editar IP en código)
-sudo python dobershark.py -i eth0 --bite
-Inyectar paquete personalizado (hex)
-# Ejemplo: Inyectar un paquete Ethernet con destino específico
-python dobershark.py -i eth0 --inject-hex "00112233445566778899aabb08004500001c..."
-Todo junto + modo silencioso
-sudo python dobershark.py -i wlan0 -f "tcp" -s --bite
+Termux:
+pkg install python tcpdump
+pip install scapy flask flask-socketio eventlet
+# mitmproxy requiere root en Termux, usar solo --web
+python dobershark.py -i wlan0 --web
 
-## 🔥 Características v4.0 (Avanzado)
+🎯 Ejemplos de uso FINAL v5.0
+# Modo completo: captura + web + HTTPS + credenciales
+sudo python dobershark.py -i eth0 --web --https
 
-### 📥 Extracción de archivos HTTP
-- Reconstruye cualquier archivo descargado por HTTP
-- Detecta nombres por Content-Disposition o URL
-- Calcula MD5 de cada archivo extraído
+# Solo web y captura (sin HTTPS)
+sudo python dobershark.py -i wlan0 --web
 
-### 🔄 Reconstrucción de sesiones TCP
-- Reensambla conversaciones TCP completas
-- Maneja paquetes fuera de orden y retransmisiones
-- Guarda sesiones en archivos binarios
+# Modo sigiloso + web (para servidores)
+sudo python dobershark.py -i eth0 --web -s
 
-### 💉 Inyección de paquetes (Modo BITE)
-- **--bite**: Responde activamente a pings (ICMP Echo Reply)
-- **--bite**: Envía RST para bloquear conexiones SSH no deseadas
-- **--inject-hex**: Inyecta paquete personalizado desde hexadecimal
-
-### Ejemplos avanzados
-```bash
-# Extraer archivos HTTP + reconstruir sesiones + modo bite
-sudo python dobershark.py -i eth0 -f "tcp" --bite
-
-# Inyección manual de paquete
-python dobershark.py -i eth0 --inject-hex "0050... (tu hex aquí)"
-
-# Modo forense (todo silencioso, solo guardar)
-sudo python dobershark.py -i eth0 -f "tcp" -s -o captura.pcap
+# Captura específica con filtro + web
+sudo python dobershark.py -i eth0 -f "tcp port 80 or tcp port 443" --web
