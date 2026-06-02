@@ -55,35 +55,46 @@ git clone https://github.com/Falconmx1/Dobershark.git
 cd Dobershark
 pip install -r requirements.txt
 
-🚀 Uso rápido
-# Ver interfaces disponibles
-python dobershark.py --list-interfaces
-
-# Capturar todo el tráfico (Ctrl+C para detener)
-python dobershark.py -i eth0
-
-# Filtro TCP puerto 80 (HTTP)
+🚀 Ejemplos de uso
+Extraer archivos HTTP descargados
 python dobershark.py -i eth0 -f "tcp port 80"
+# Los archivos aparecerán en http_downloads/
+Reconstruir sesiones TCP completas
+python dobershark.py -i eth0 -f "tcp"
+# Las sesiones se guardan en tcp_sessions/ como archivos binarios
+Modo BITE (respuesta activa)
+# Responde a pings y bloquea SSH a IP específica (editar IP en código)
+sudo python dobershark.py -i eth0 --bite
+Inyectar paquete personalizado (hex)
+# Ejemplo: Inyectar un paquete Ethernet con destino específico
+python dobershark.py -i eth0 --inject-hex "00112233445566778899aabb08004500001c..."
+Todo junto + modo silencioso
+sudo python dobershark.py -i wlan0 -f "tcp" -s --bite
 
-# Filtro UDP puerto 53 (DNS)
-python dobershark.py -i wlan0 -f "udp port 53"
+## 🔥 Características v4.0 (Avanzado)
 
-# Guardar captura a archivo
-python dobershark.py -i eth0 -f "tcp" -o captura.pcap
+### 📥 Extracción de archivos HTTP
+- Reconstruye cualquier archivo descargado por HTTP
+- Detecta nombres por Content-Disposition o URL
+- Calcula MD5 de cada archivo extraído
 
-## 🌟 Características avanzadas (v3.0)
+### 🔄 Reconstrucción de sesiones TCP
+- Reensambla conversaciones TCP completas
+- Maneja paquetes fuera de orden y retransmisiones
+- Guarda sesiones en archivos binarios
 
-### 🔍 IPv6 completo
-- Captura y análisis de tráfico IPv6
-- Compresión automática de direcciones
-- ICMPv6, TCPv6, UDPv6 y HTTP sobre IPv6
+### 💉 Inyección de paquetes (Modo BITE)
+- **--bite**: Responde activamente a pings (ICMP Echo Reply)
+- **--bite**: Envía RST para bloquear conexiones SSH no deseadas
+- **--inject-hex**: Inyecta paquete personalizado desde hexadecimal
 
-### 📁 Extracción de archivos SMB
-- Reconstruye archivos transferidos por SMB/CIFS (puerto 445)
-- Detecta comandos Create AndX y WRITE AndX
-- Guarda archivos en carpeta `smb_extracted/` con timestamp
-
-### 🤫 Modo silencioso
+### Ejemplos avanzados
 ```bash
-python dobershark.py -i eth0 -s              # Sin banner
-python dobershark.py -i eth0 -f "tcp port 445" -s -o captura.pcap
+# Extraer archivos HTTP + reconstruir sesiones + modo bite
+sudo python dobershark.py -i eth0 -f "tcp" --bite
+
+# Inyección manual de paquete
+python dobershark.py -i eth0 --inject-hex "0050... (tu hex aquí)"
+
+# Modo forense (todo silencioso, solo guardar)
+sudo python dobershark.py -i eth0 -f "tcp" -s -o captura.pcap
