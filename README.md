@@ -16,22 +16,10 @@
 - ✅ **Análisis de protocolos**: IP, TCP, UDP, ARP, DNS, HTTP
 - ✅ **Multiplataforma**: Windows (Npcap), Linux (libpcap), Termux (tcpdump)
 
-## 📸 Banner del Doberman
-
-Al ejecutar Dobershark, verás:
-╔═══════════════════════════════════════╗
-║ 🐕‍🦺 DOBERSHARK v1.0 ║
-║ "Olfateando la red con precisión" ║
-╚═══════════════════════════════════════╝
-
-__
-/ _) ¡Woof! Listo para cazar paquetes.
-| (
-¯¯¯
-
-
 🚀 Instalación completa (Windows/Linux/Termux)
+
 Linux/Kali:
+
 sudo apt update
 sudo apt install python3 python3-pip tcpdump
 pip3 install scapy flask flask-socketio eventlet mitmproxy
