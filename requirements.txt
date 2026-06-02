@@ -1,1 +1,5 @@
 scapy>=2.5.0
+flask>=2.0.0
+flask-socketio>=5.0.0
+eventlet>=0.33.0
+mitmproxy>=10.0.0
